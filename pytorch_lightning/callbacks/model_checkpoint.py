@@ -10,11 +10,12 @@ import os
 import re
 
 import numpy as np
+from typing import Optional
 
+import torch
 from pytorch_lightning import _logger as log
 from pytorch_lightning.callbacks.base import Callback
-from pytorch_lightning.utilities import rank_zero_warn
-import torch
+from pytorch_lightning.utilities import rank_zero_warn, rank_zero_only
 
 
 class ModelCheckpoint(Callback):
@@ -37,8 +38,12 @@ class ModelCheckpoint(Callback):
                 ...     filepath='my/path/{epoch}-{val_loss:.2f}-{other_metric:.2f}'
                 ... )
 
+            Can also be set to `None`, then it will be set to default location
+            during trainer construction.
+
         monitor: quantity to monitor.
         verbose: verbosity mode. Default: ``False``.
+        save_last: always saves the model at the end of the epoch. Default: ``False``.
         save_top_k: if `save_top_k == k`,
             the best k models according to
             the quantity monitored will be saved.
@@ -78,24 +83,28 @@ class ModelCheckpoint(Callback):
 
     """
 
-    def __init__(self, filepath: str, monitor: str = 'val_loss', verbose: bool = False,
-                 save_top_k: int = 1, save_weights_only: bool = False,
+    def __init__(self, filepath: Optional[str] = None, monitor: str = 'val_loss', verbose: bool = False,
+                 save_last: bool = False, save_top_k: int = 1, save_weights_only: bool = False,
                  mode: str = 'auto', period: int = 1, prefix: str = ''):
         super().__init__()
-        if save_top_k > 0 and os.path.isdir(filepath) and len(os.listdir(filepath)) > 0:
+        if save_top_k > 0 and filepath is not None and os.path.isdir(filepath) and len(os.listdir(filepath)) > 0:
             rank_zero_warn(
                 f"Checkpoint directory {filepath} exists and is not empty with save_top_k != 0."
                 "All files in this directory will be deleted when a checkpoint is saved!"
             )
+        self._rank = 0
 
         self.monitor = monitor
         self.verbose = verbose
-        if os.path.isdir(filepath):
-            self.dirpath, self.filename = filepath, '{epoch}'
+        if filepath is None:  # will be determined by trainer at runtime
+            self.dirpath, self.filename = None, None
         else:
-            self.dirpath, self.filename = os.path.split(filepath)
-
-        os.makedirs(self.dirpath, exist_ok=True)
+            if os.path.isdir(filepath):
+                self.dirpath, self.filename = filepath, '{epoch}'
+            else:
+                self.dirpath, self.filename = os.path.split(filepath)
+            os.makedirs(self.dirpath, exist_ok=True)
+        self.save_last = save_last
         self.save_top_k = save_top_k
         self.save_weights_only = save_weights_only
         self.period = period
@@ -109,10 +118,10 @@ class ModelCheckpoint(Callback):
 
         torch_inf = torch.tensor(np.Inf)
         mode_dict = {
-            'min': (torch.lt, torch_inf, 'min'),
-            'max': (torch.gt, -torch_inf, 'max'),
-            'auto': (torch.gt, -torch_inf, 'max') if 'acc' in self.monitor or self.monitor.startswith('fmeasure')
-            else (torch.lt, torch_inf, 'min'),
+            'min': (torch_inf, 'min'),
+            'max': (-torch_inf, 'max'),
+            'auto': (-torch_inf, 'max') if 'acc' in self.monitor or self.monitor.startswith('fmeasure')
+            else (torch_inf, 'min'),
         }
 
         if mode not in mode_dict:
@@ -120,10 +129,11 @@ class ModelCheckpoint(Callback):
                            f'fallback to auto mode.', RuntimeWarning)
             mode = 'auto'
 
-        self.monitor_op, self.kth_value, self.mode = mode_dict[mode]
+        self.kth_value, self.mode = mode_dict[mode]
 
     def _del_model(self, filepath):
-        os.remove(filepath)
+        if os.path.isfile(filepath):
+            os.remove(filepath)
 
     def _save_model(self, filepath):
         # make paths
@@ -131,7 +141,7 @@ class ModelCheckpoint(Callback):
 
         # delegate the saving to the model
         if self.save_function is not None:
-            self.save_function(filepath)
+            self.save_function(filepath, self.save_weights_only)
         else:
             raise ValueError(".save_function() not set")
 
@@ -141,9 +151,18 @@ class ModelCheckpoint(Callback):
             return True
 
         if not isinstance(current, torch.Tensor):
+            rank_zero_warn(
+                f'{current} is supposed to be a torch.Tensor. Saving checkpoint may not work correctly. '
+                f'HINT: check the value of {self.monitor} in your validation loop', RuntimeWarning
+            )
             current = torch.tensor(current)
 
-        return self.monitor_op(current, self.best_k_models[self.kth_best_model])
+        monitor_op = {
+            "min": torch.lt,
+            "max": torch.gt,
+        }[self.mode]
+
+        return monitor_op(current, self.best_k_models[self.kth_best_model])
 
     def format_checkpoint_name(self, epoch, metrics, ver=None):
         """Generate a filename according to the defined template.
@@ -183,6 +202,7 @@ class ModelCheckpoint(Callback):
         filepath = os.path.join(self.dirpath, self.prefix + filename + str_ver + '.ckpt')
         return filepath
 
+    @rank_zero_only
     def on_validation_end(self, trainer, pl_module):
         # only run on main process
         if trainer.proc_rank != 0:
@@ -199,6 +219,10 @@ class ModelCheckpoint(Callback):
 
         self.epoch_last_check = epoch
 
+        if self.save_last:
+            filepath = os.path.join(self.dirpath, self.prefix + 'last.ckpt')
+            self._save_model(filepath)
+
         filepath = self.format_checkpoint_name(epoch, metrics)
         version_cnt = 0
         while os.path.isfile(filepath):
@@ -208,6 +232,12 @@ class ModelCheckpoint(Callback):
 
         if self.save_top_k != -1:
             current = metrics.get(self.monitor)
+
+            if not isinstance(current, torch.Tensor):
+                rank_zero_warn(
+                    f'The metric you returned {current} must be a Torch.Tensor instance, checkpoint not saved '
+                    f'HINT: what is the value of {self.monitor} in validation_end()?', RuntimeWarning
+                )
 
             if current is None:
                 rank_zero_warn(

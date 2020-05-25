@@ -84,6 +84,7 @@ At a rough level, here's what happens inside Trainer :py:mod:`pytorch_lightning.
 """
 
 import os
+import pickle
 import re
 import signal
 from abc import ABC
@@ -95,13 +96,13 @@ import torch
 import torch.distributed as torch_distrib
 
 from pytorch_lightning import _logger as log
-from pytorch_lightning.core.lightning import LightningModule
+from pytorch_lightning.core.lightning import LightningModule, CHECKPOINT_KEY_MODULE_ARGS
 from pytorch_lightning.loggers import LightningLoggerBase
 from pytorch_lightning.overrides.data_parallel import (
     LightningDistributedDataParallel,
     LightningDataParallel,
 )
-from pytorch_lightning.utilities import rank_zero_warn
+from pytorch_lightning.utilities import rank_zero_warn, parsing
 
 try:
     import torch_xla
@@ -111,6 +112,19 @@ except ImportError:
     XLA_AVAILABLE = False
 else:
     XLA_AVAILABLE = True
+
+try:
+    import horovod.torch as hvd
+except ImportError:
+    HOROVOD_AVAILABLE = False
+else:
+    HOROVOD_AVAILABLE = True
+
+PRIMITIVE_TYPES = (
+    bool, int, float, str,
+    list, tuple, set, dict,
+    Namespace,  # for back compatibility
+)
 
 
 class TrainerIOMixin(ABC):
@@ -123,6 +137,7 @@ class TrainerIOMixin(ABC):
     resume_from_checkpoint: ...
     use_ddp: bool
     use_ddp2: bool
+    use_horovod: bool
     checkpoint_callback: ...
     proc_rank: int
     weights_save_path: str
@@ -133,6 +148,9 @@ class TrainerIOMixin(ABC):
     on_tpu: bool
     num_training_batches: int
     accumulate_grad_batches: int
+    use_amp: bool
+    use_native_amp: bool
+    scaler: ...
 
     def get_model(self):
         is_dp_module = isinstance(self.model, (LightningDistributedDataParallel,
@@ -175,6 +193,10 @@ class TrainerIOMixin(ABC):
             # wait for all processes to catch up
             torch_xla.core.xla_model.rendezvous("pl.TrainerIOMixin.restore_weights")
 
+        elif self.use_horovod:
+            # wait for all processes to catch up
+            hvd.join()
+
         # clear cache after restore
         if self.on_gpu:
             torch.cuda.empty_cache()
@@ -215,7 +237,7 @@ class TrainerIOMixin(ABC):
             if result == 0:
                 log.info(f'requeued exp {job_id}')
             else:
-                log.info('requeue failed...')
+                log.warning('requeue failed...')
 
             # close experiment to avoid issues
             self.logger.close()
@@ -244,17 +266,18 @@ class TrainerIOMixin(ABC):
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, filepath)
 
-    def save_checkpoint(self, filepath):
-        checkpoint = self.dump_checkpoint()
+    def save_checkpoint(self, filepath, weights_only: bool = False):
+        checkpoint = self.dump_checkpoint(weights_only)
 
         if self.proc_rank == 0:
             # do the actual save
             try:
                 self._atomic_save(checkpoint, filepath)
-            except AttributeError:
-                if 'hparams' in checkpoint:
-                    del checkpoint['hparams']
-
+            except AttributeError as err:
+                if CHECKPOINT_KEY_MODULE_ARGS in checkpoint:
+                    del checkpoint[CHECKPOINT_KEY_MODULE_ARGS]
+                rank_zero_warn('Warning, `module_arguments` dropped from checkpoint.'
+                               f' An attribute is not picklable {err}')
                 self._atomic_save(checkpoint, filepath)
 
     def restore(self, checkpoint_path: str, on_gpu: bool):
@@ -278,52 +301,69 @@ class TrainerIOMixin(ABC):
 
         # load the state_dict on the model automatically
         model.load_state_dict(checkpoint['state_dict'])
+
+        # give model a chance to load something
+        model.on_load_checkpoint(checkpoint)
+
         if on_gpu:
             model.cuda(self.root_gpu)
+
+        # restore amp scaling
+        if self.use_amp and self.use_native_amp and 'native_amp_scaling_state' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['native_amp_scaling_state'])
 
         # load training state (affects trainer only)
         self.restore_training_state(checkpoint)
 
-    def dump_checkpoint(self):
+    def dump_checkpoint(self, weights_only: bool = False) -> dict:
+        """Creating model checkpoint.
+
+        Args:
+            weights_only: saving model weights only
+
+        Return:
+             structured dictionary
+        """
         checkpoint = {
             'epoch': self.current_epoch + 1,
             'global_step': self.global_step + 1,
         }
 
-        if self.checkpoint_callback is not None and self.checkpoint_callback is not False:
-            checkpoint['checkpoint_callback_best'] = self.checkpoint_callback.best
+        if not weights_only:
+            if self.checkpoint_callback:
+                checkpoint['checkpoint_callback_best'] = self.checkpoint_callback.best
 
-        if self.early_stop_callback is not None and self.checkpoint_callback is not False:
-            checkpoint['early_stop_callback_wait'] = self.early_stop_callback.wait
-            checkpoint['early_stop_callback_patience'] = self.early_stop_callback.patience
+            if self.early_stop_callback:
+                checkpoint['early_stop_callback_wait'] = self.early_stop_callback.wait
+                checkpoint['early_stop_callback_patience'] = self.early_stop_callback.patience
 
-        # save optimizers
-        optimizer_states = []
-        for i, optimizer in enumerate(self.optimizers):
-            optimizer_states.append(optimizer.state_dict())
+            # save optimizers
+            optimizer_states = []
+            for i, optimizer in enumerate(self.optimizers):
+                optimizer_states.append(optimizer.state_dict())
 
-        checkpoint['optimizer_states'] = optimizer_states
+            checkpoint['optimizer_states'] = optimizer_states
 
-        # save lr schedulers
-        lr_schedulers = []
-        for scheduler in self.lr_schedulers:
-            lr_schedulers.append(scheduler['scheduler'].state_dict())
+            # save lr schedulers
+            lr_schedulers = []
+            for scheduler in self.lr_schedulers:
+                lr_schedulers.append(scheduler['scheduler'].state_dict())
 
-        checkpoint['lr_schedulers'] = lr_schedulers
+            checkpoint['lr_schedulers'] = lr_schedulers
 
-        # add the hparams and state_dict from the model
+            # save native amp scaling
+            if self.use_amp and self.use_native_amp:
+                checkpoint['native_amp_scaling_state'] = self.scaler.state_dict()
+
+        # add the module_arguments and state_dict from the model
         model = self.get_model()
 
         checkpoint['state_dict'] = model.state_dict()
 
-        if hasattr(model, "hparams"):
-            is_namespace = isinstance(model.hparams, Namespace)
-            checkpoint['hparams'] = vars(model.hparams) if is_namespace else model.hparams
-            checkpoint['hparams_type'] = 'namespace' if is_namespace else 'dict'
-        else:
-            rank_zero_warn(
-                "Did not find hyperparameters at model hparams. Saving checkpoint without hyperparameters."
-            )
+        if hasattr(model, CHECKPOINT_KEY_MODULE_ARGS) and model.module_arguments:
+            # add arguments to the checkpoint
+            checkpoint[CHECKPOINT_KEY_MODULE_ARGS] = {k: v for k, v in model.module_arguments.items()
+                                                      if isinstance(v, PRIMITIVE_TYPES)}
 
         # give the model a chance to add a few things
         model.on_save_checkpoint(checkpoint)
@@ -356,6 +396,12 @@ class TrainerIOMixin(ABC):
         :param checkpoint:
         :return:
         """
+        if 'optimizer_states' not in checkpoint or 'lr_schedulers' not in checkpoint:
+            raise KeyError(
+                'Trying to restore training state but checkpoint contains only the model.'
+                ' This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`.'
+            )
+
         if self.checkpoint_callback is not None and self.checkpoint_callback is not False:
             self.checkpoint_callback.best = checkpoint['checkpoint_callback_best']
 
@@ -421,10 +467,11 @@ class TrainerIOMixin(ABC):
         # TODO: fix for anything with multiprocess DP, DDP, DDP2
         try:
             self._atomic_save(checkpoint, filepath)
-        except AttributeError:
-            if 'hparams' in checkpoint:
-                del checkpoint['hparams']
-
+        except AttributeError as err:
+            if CHECKPOINT_KEY_MODULE_ARGS in checkpoint:
+                del checkpoint[CHECKPOINT_KEY_MODULE_ARGS]
+            rank_zero_warn('warning, `module_arguments` dropped from checkpoint.'
+                           f' An attribute is not picklable {err}')
             self._atomic_save(checkpoint, filepath)
 
         return filepath
@@ -440,6 +487,10 @@ class TrainerIOMixin(ABC):
 
         # load the state_dict on the model automatically
         model.load_state_dict(checkpoint['state_dict'])
+
+        # restore amp scaling
+        if self.use_amp and self.use_native_amp and 'native_amp_scaling_state' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['native_amp_scaling_state'])
 
         if self.root_gpu is not None:
             model.cuda(self.root_gpu)

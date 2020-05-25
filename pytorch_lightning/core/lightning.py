@@ -1,6 +1,7 @@
 import collections
 import inspect
 import os
+import warnings
 from abc import ABC, abstractmethod
 from argparse import Namespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Sequence
@@ -16,7 +17,8 @@ from pytorch_lightning import _logger as log
 from pytorch_lightning.core.grads import GradInformation
 from pytorch_lightning.core.hooks import ModelHooks
 from pytorch_lightning.core.memory import ModelSummary
-from pytorch_lightning.core.saving import ModelIO, load_hparams_from_tags_csv
+from pytorch_lightning.core.saving import ModelIO, load_hparams_from_tags_csv, load_hparams_from_yaml
+from pytorch_lightning.utilities.device_dtype_mixin import DeviceDtypeModuleMixin
 from pytorch_lightning.overrides.data_parallel import LightningDistributedDataParallel
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from pytorch_lightning.utilities import rank_zero_warn
@@ -28,14 +30,13 @@ except ImportError:
 else:
     XLA_AVAILABLE = True
 
+CHECKPOINT_KEY_MODULE_ARGS = 'module_arguments'
 
-class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
+
+class LightningModule(ABC, DeviceDtypeModuleMixin, GradInformation, ModelIO, ModelHooks):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        #: Current dtype
-        self.dtype = torch.FloatTensor
 
         self.exp_save_path = None
 
@@ -54,10 +55,6 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
         self.logger = None
         self.example_input_array = None
 
-        #: True if your model is currently running on GPUs.
-        #: Useful to set flags around the LightningModule for different CPU vs GPU behavior.
-        self.on_gpu = False
-
         #: True if using dp
         self.use_dp = False
 
@@ -67,10 +64,28 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
         #: True if using ddp2
         self.use_ddp2 = False
 
+        # True if on tpu
+        self.use_tpu = False
+
         #: True if using amp
         self.use_amp = False
 
-        self.hparams = None
+        #: Current dtype
+        self._dtype = torch.float
+
+        #: device reference
+        self._device = torch.device('cpu')
+
+        # register all params passed into the child module in __init__
+        self._auto_collect_arguments()
+
+    @property
+    def on_gpu(self):
+        """
+        True if your model is currently running on GPUs.
+        Useful to set flags around the LightningModule for different CPU vs GPU behavior.
+        """
+        return self.device.type == 'cuda'
 
     def print(self, *args, **kwargs) -> None:
         r"""
@@ -257,6 +272,7 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
             May contain the following optional keys:
 
             - log (metrics to be added to the logger; only tensors)
+            - progress_bar (dict for progress bar display)
             - any metric used in a callback (e.g. early stopping).
 
         Note:
@@ -280,7 +296,8 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
 
                     # log training accuracy at the end of an epoch
                     results = {
-                        'log': {'train_acc': train_acc_mean.item()}
+                        'log': {'train_acc': train_acc_mean.item()},
+                        'progress_bar': {'train_acc': train_acc_mean},
                     }
                     return results
 
@@ -303,6 +320,7 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
                     # log training accuracy at the end of an epoch
                     results = {
                         'log': {'train_acc': train_acc_mean.item(), 'step': self.current_epoch}
+                        'progress_bar': {'train_acc': train_acc_mean},
                     }
                     return results
         """
@@ -875,7 +893,7 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
 
     def _init_slurm_connection(self) -> None:
         """
-        Sets up environemnt variables necessary for pytorch distributed communications
+        Sets up environment variables necessary for pytorch distributed communications
         based on slurm environment.
         """
         # use slurm job id for the port number
@@ -930,16 +948,19 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
         if 'MASTER_ADDR' not in os.environ:
             log.warning("MASTER_ADDR environment variable is not defined. Set as localhost")
             os.environ['MASTER_ADDR'] = '127.0.0.1'
+        log.debug(f"MASTER_ADDR: {os.environ['MASTER_ADDR']}")
 
         if 'MASTER_PORT' not in os.environ:
             log.warning("MASTER_PORT environment variable is not defined. Set as 12910")
             os.environ['MASTER_PORT'] = '12910'
+        log.debug(f"MASTER_PORT: {os.environ['MASTER_PORT']}")
 
-        if 'WORLD_SIZE' in os.environ and os.environ['WORLD_SIZE'] != world_size:
-            log.warning("WORLD_SIZE environment variable is not equal to the computed "
-                        "world size. Ignored.")
+        if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) != world_size:
+            log.warning(f"WORLD_SIZE environment variable ({os.environ['WORLD_SIZE']}) "
+                        f"is not equal to the computed world size ({world_size}). Ignored.")
 
         torch_backend = "nccl" if self.trainer.on_gpu else "gloo"
+        log.info(f"initializing proc_rank {proc_rank} world {world_size}")
         torch_distrib.init_process_group(torch_backend, rank=proc_rank, world_size=world_size)
 
     def configure_apex(
@@ -1143,7 +1164,7 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
                     if self.trainer.global_step < 500:
                         lr_scale = min(1., float(self.trainer.global_step + 1) / 500.)
                         for pg in optimizer.param_groups:
-                            pg['lr'] = lr_scale * self.hparams.learning_rate
+                            pg['lr'] = lr_scale * self.learning_rate
 
                     # update params
                     optimizer.step()
@@ -1157,9 +1178,22 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
         if self.trainer.use_tpu and XLA_AVAILABLE:
             xm.optimizer_step(optimizer)
         elif isinstance(optimizer, torch.optim.LBFGS):
+
+            # native amp + lbfgs is a no go right now
+            if self.trainer.use_amp and self.trainer.use_native_amp:
+                raise MisconfigurationException(
+                    'native PyTorch amp and lbfgs are not compatible.'
+                    ' To request, please file a Github issue in PyTorch and tag @mcarilli')
             optimizer.step(second_order_closure)
         else:
-            optimizer.step()
+            if self.trainer.use_amp and self.trainer.use_native_amp:
+                self.trainer.scaler.step(optimizer)
+            else:
+                optimizer.step()
+
+        # in native 16-bit we need to update scaler after optimizer step
+        if self.trainer.use_amp and self.trainer.use_native_amp:
+            self.trainer.scaler.update()
 
         # model hook
         self.on_before_zero_grad(optimizer)
@@ -1284,7 +1318,7 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
                                     download=True)
                     loader = torch.utils.data.DataLoader(
                         dataset=dataset,
-                        batch_size=self.hparams.batch_size,
+                        batch_size=self.batch_size,
                         shuffle=True
                     )
                     return loader
@@ -1335,8 +1369,8 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
                                     download=True)
                     loader = torch.utils.data.DataLoader(
                         dataset=dataset,
-                        batch_size=self.hparams.batch_size,
-                        shuffle=True
+                        batch_size=self.batch_size,
+                        shuffle=False
                     )
 
                     return loader
@@ -1380,8 +1414,8 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
                                     transform=transform, download=True)
                     loader = torch.utils.data.DataLoader(
                         dataset=dataset,
-                        batch_size=self.hparams.batch_size,
-                        shuffle=True
+                        batch_size=self.batch_size,
+                        shuffle=False
                     )
 
                     return loader
@@ -1416,49 +1450,59 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
     def load_from_checkpoint(
             cls,
             checkpoint_path: str,
+            *args,
             map_location: Optional[Union[Dict[str, str], str, torch.device, int, Callable]] = None,
-            tags_csv: Optional[str] = None,
-            *args, **kwargs
+            hparams_file: Optional[str] = None,
+            tags_csv: Optional[str] = None,  # backward compatible, todo: remove in v0.9.0
+            **kwargs
     ) -> 'LightningModule':
         r"""
         Primary way of loading a model from a checkpoint. When Lightning saves a checkpoint
-        it stores the hyperparameters in the checkpoint if you initialized your :class:`LightningModule`
-        with an argument called ``hparams`` which is a :class:`~argparse.Namespace`
-        (output of :meth:`~argparse.ArgumentParser.parse_args` when parsing command line arguments).
-        Any other arguments specified through \*args and \*\*kwargs will be passed to the model.
+        it stores the arguments passed to `__init__`  in the checkpoint under `module_arguments`
 
-        Example:
-            .. code-block:: python
-
-                from argparse import Namespace
-                hparams = Namespace(**{'learning_rate': 0.1})
-
-                model = MyModel(hparams)
-
-                class MyModel(LightningModule):
-                    def __init__(self, hparams):
-                        self.learning_rate = hparams.learning_rate
+        Any arguments specified through \*args and \*\*kwargs will override args stored in `module_arguments`.
 
         Args:
             checkpoint_path: Path to checkpoint.
-            model_args: Any keyword args needed to init the model.
+            args: Any positional args needed to init the model.
             map_location:
                 If your checkpoint saved a GPU model and you now load on CPUs
                 or a different number of GPUs, use this to map to the new setup.
                 The behaviour is the same as in :func:`torch.load`.
-            tags_csv: Optional path to a .csv file with two columns (key, value)
+            hparams_file: Optional path to a .yaml file with hierarchical structure
+                as in this example::
+
+                    drop_prob: 0.2
+                    dataloader:
+                        batch_size: 32
+
+                You most likely won't need this since Lightning will always save the hyperparameters
+                to the checkpoint.
+                However, if your checkpoint weights don't have the hyperparameters saved,
+                use this method to pass in a .yaml file with the hparams you'd like to use.
+                These will be converted into a :class:`~dict` and passed into your
+                :class:`LightningModule` for use.
+
+                If your model's `hparams` argument is :class:`~argparse.Namespace`
+                and .yaml file has hierarchical structure, you need to refactor your model to treat
+                `hparams` as :class:`~dict`.
+
+                .csv files are acceptable here till v0.9.0, see tags_csv argument for detailed usage.
+            tags_csv:
+                .. warning:: .. deprecated:: 0.7.6
+
+                    `tags_csv` argument is deprecated in v0.7.6. Will be removed v0.9.0.
+
+                Optional path to a .csv file with two columns (key, value)
                 as in this example::
 
                     key,value
                     drop_prob,0.2
                     batch_size,32
 
-                You most likely won't need this since Lightning will always save the hyperparameters
-                to the checkpoint.
-                However, if your checkpoint weights don't have the hyperparameters saved,
-                use this method to pass in a .csv file with the hparams you'd like to use.
-                These will be converted into a :class:`~argparse.Namespace` and passed into your
-                :class:`LightningModule` for use.
+                Use this method to pass in a .csv file with the hparams you'd like to use.
+            hparam_overrides: A dictionary with keys to override in the hparams
+            kwargs: Any keyword args needed to init the model.
 
         Return:
             :class:`LightningModule` with loaded weights and hyperparameters (if available).
@@ -1479,15 +1523,14 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
                 # or load weights and hyperparameters from separate files.
                 MyLightningModule.load_from_checkpoint(
                     'path/to/checkpoint.ckpt',
-                    tags_csv='/path/to/hparams_file.csv'
+                    hparams_file='/path/to/hparams_file.yaml'
                 )
 
-                # or load passing whatever args the model takes to load
+                # override some of the params with new values
                 MyLightningModule.load_from_checkpoint(
-                    'path/to/checkpoint.ckpt',
-                    learning_rate=0.1, # These arguments will be passed to the model using **kwargs
-                    layers=2,
-                    pretrained_model=some_model
+                    PATH,
+                    num_layers=128,
+                    pretrained_ckpt_path: NEW_PATH,
                 )
 
                 # predict
@@ -1500,43 +1543,41 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
         else:
             checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
 
+        # add the hparams from csv file to checkpoint
         if tags_csv is not None:
-            # add the hparams from csv file to checkpoint
-            hparams = load_hparams_from_tags_csv(tags_csv)
-            hparams.__setattr__('on_gpu', False)
-            checkpoint['hparams'] = vars(hparams)
+            hparams_file = tags_csv
+            rank_zero_warn('`tags_csv` argument is deprecated in v0.7.6. Will be removed v0.9.0', DeprecationWarning)
+
+        if hparams_file is not None:
+            extension = hparams_file.split('.')[-1]
+            if extension.lower() in ('csv'):
+                hparams = load_hparams_from_tags_csv(hparams_file)
+            elif extension.lower() in ('yml', 'yaml'):
+                hparams = load_hparams_from_yaml(hparams_file)
+            else:
+                raise ValueError('.csv, .yml or .yaml is required for `hparams_file`')
+
+            hparams['on_gpu'] = False
+
+            # overwrite hparams by the given file
+            checkpoint[CHECKPOINT_KEY_MODULE_ARGS] = hparams
+
+        # override the module_arguments with values that were passed in
+        checkpoint[CHECKPOINT_KEY_MODULE_ARGS].update(kwargs)
 
         model = cls._load_model_state(checkpoint, *args, **kwargs)
         return model
 
     @classmethod
     def _load_model_state(cls, checkpoint: Dict[str, Any], *args, **kwargs) -> 'LightningModule':
-        cls_takes_hparams = 'hparams' in inspect.signature(cls.__init__).parameters
-        ckpt_hparams = checkpoint.get('hparams')
 
-        if cls_takes_hparams:
-            if ckpt_hparams is not None:
-                is_namespace = checkpoint.get('hparams_type', 'namespace') == 'namespace'
-                hparams = Namespace(**ckpt_hparams) if is_namespace else ckpt_hparams
-            else:
-                rank_zero_warn(
-                    f"Checkpoint does not contain hyperparameters but {cls.__name__}'s __init__ "
-                    f"contains argument 'hparams'. Will pass in an empty Namespace instead."
-                    " Did you forget to store your model hyperparameters in self.hparams?"
-                )
-                hparams = Namespace()
-        else:  # The user's LightningModule does not define a hparams argument
-            if ckpt_hparams is None:
-                hparams = None
-            else:
-                raise MisconfigurationException(
-                    f"Checkpoint contains hyperparameters but {cls.__name__}'s __init__ "
-                    f"is missing the argument 'hparams'. Are you loading the correct checkpoint?"
-                )
+        # pass in the values we saved automatically
+        if CHECKPOINT_KEY_MODULE_ARGS in checkpoint:
+            model_args = checkpoint[CHECKPOINT_KEY_MODULE_ARGS]
+            kwargs.update(**model_args)
 
         # load the state_dict on the model automatically
-        model_args = [hparams] if hparams else []
-        model = cls(*model_args, *args, **kwargs)
+        model = cls(*args, **kwargs)
         model.load_state_dict(checkpoint['state_dict'])
 
         # give model a chance to load something
@@ -1623,7 +1664,7 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
 
         """
 
-    def get_tqdm_dict(self) -> Dict[str, Union[int, str]]:
+    def get_progress_bar_dict(self) -> Dict[str, Union[int, str]]:
         r"""
         Additional items to be displayed in the progress bar.
 
@@ -1644,3 +1685,64 @@ class LightningModule(ABC, GradInformation, ModelIO, ModelHooks):
             tqdm_dict['v_num'] = self.trainer.logger.version
 
         return tqdm_dict
+
+    def get_tqdm_dict(self) -> Dict[str, Union[int, str]]:
+        """
+        Additional items to be displayed in the progress bar.
+
+        Return:
+            Dictionary with the items to be displayed in the progress bar.
+
+        Warning:
+            Deprecated since v0.7.3.
+            Use :meth:`get_progress_bar_dict` instead.
+        """
+        rank_zero_warn("`get_tqdm_dict` was renamed to `get_progress_bar_dict` in v0.7.3"
+                       " and this method will be removed in v1.0.0", DeprecationWarning)
+        return self.get_progress_bar_dict()
+
+    def _auto_collect_arguments(self):
+        """Collect all arguments module arguments."""
+        frame = inspect.currentframe()
+
+        frame_args = _collect_init_args(frame.f_back, [])
+        child = _get_latest_child(frame)
+
+        # set module_arguments in child
+        child._module_self_arguments = frame_args[-1]
+        child._module_parents_arguments = {}
+        for args in frame_args[:-1]:
+            child._module_parents_arguments.update(args)
+
+    @property
+    def module_arguments(self) -> dict:
+        """Aggregate this module and all parents arguments."""
+        args = dict(self._module_parents_arguments)
+        args.update(self._module_self_arguments)
+        return args
+
+
+def _collect_init_args(frame, path_args: list) -> list:
+    """Recursive search for all children."""
+    if '__class__' in frame.f_locals:
+        local_args = dict(frame.f_locals)
+        local_args.update(local_args.get('kwargs', {}))
+        local_args = {k: v for k, v in local_args.items()
+                      if k not in ('args', 'kwargs', 'self', '__class__', 'frame', 'frame_args')}
+        # if 'hparams' in local_args:
+        #     # back compatible hparams as single argument
+        #     hparams = local_args.get('hparams')
+        #     local_args.update(vars(hparams) if isinstance(hparams, Namespace) else hparams)
+        # recursive update
+        path_args.append(local_args)
+        return _collect_init_args(frame.f_back, path_args)
+    else:
+        return path_args
+
+
+def _get_latest_child(frame, child: object = None) -> object:
+    """Recursive search for lowest child."""
+    if 'self' in frame.f_locals:
+        return _get_latest_child(frame.f_back, frame.f_locals['self'])
+    else:
+        return child

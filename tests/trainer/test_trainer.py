@@ -1,77 +1,39 @@
 import glob
 import math
 import os
-from argparse import Namespace, ArgumentParser
+import types
+from argparse import Namespace
 
 import pytest
 import torch
 
 import tests.base.utils as tutils
+from pytorch_lightning import Callback, LightningModule
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-from pytorch_lightning import Callback
-from pytorch_lightning.core.lightning import load_hparams_from_tags_csv
+from pytorch_lightning.core.lightning import CHECKPOINT_KEY_MODULE_ARGS
+from pytorch_lightning.core.saving import load_hparams_from_tags_csv, load_hparams_from_yaml, save_hparams_to_tags_csv
+from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.trainer.logging import TrainerLoggingMixin
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
-from tests.base import (
-    TestModelBase,
-    DictHparamsModel,
-    LightningTestModel,
-    LightEmptyTestStep,
-    LightValidationStepMixin,
-    LightValidationMultipleDataloadersMixin,
-    LightTrainDataloader,
-    LightTestDataloader,
-    LightValidationMixin,
-)
-
-
-def test_hparams_save_load(tmpdir):
-    model = DictHparamsModel({'in_features': 28 * 28, 'out_features': 10})
-
-    # logger file to get meta
-    trainer_options = dict(
-        default_root_dir=tmpdir,
-        max_epochs=1,
-    )
-
-    # fit model
-    trainer = Trainer(**trainer_options)
-    result = trainer.fit(model)
-
-    assert result == 1
-
-    # try to load the model now
-    pretrained_model = tutils.load_model_from_checkpoint(
-        trainer.checkpoint_callback.dirpath,
-        module_class=DictHparamsModel
-    )
+from tests.base import EvalModelTemplate
 
 
 def test_no_val_module(tmpdir):
     """Tests use case where trainer saves the model, and user loads it from tags independently."""
-    tutils.reset_seed()
 
-    hparams = tutils.get_default_hparams()
-
-    class CurrentTestModel(LightTrainDataloader, TestModelBase):
-        pass
-
-    model = CurrentTestModel(hparams)
+    model = EvalModelTemplate()
 
     # logger file to get meta
-    logger = tutils.get_default_testtube_logger(tmpdir, False)
+    logger = tutils.get_default_logger(tmpdir)
 
-    trainer_options = dict(
+    trainer = Trainer(
         max_epochs=1,
         logger=logger,
         checkpoint_callback=ModelCheckpoint(tmpdir)
     )
-
     # fit model
-    trainer = Trainer(**trainer_options)
     result = trainer.fit(model)
-
     # training complete
     assert result == 1, 'amp + ddp model failed to complete'
 
@@ -79,37 +41,34 @@ def test_no_val_module(tmpdir):
     new_weights_path = os.path.join(tmpdir, 'save_test.ckpt')
     trainer.save_checkpoint(new_weights_path)
 
+    # assert ckpt has hparams
+    ckpt = torch.load(new_weights_path)
+    assert CHECKPOINT_KEY_MODULE_ARGS in ckpt.keys(), 'module_arguments missing from checkpoints'
+
     # load new model
-    tags_path = tutils.get_data_path(logger, path_dir=tmpdir)
-    tags_path = os.path.join(tags_path, 'meta_tags.csv')
-    model_2 = LightningTestModel.load_from_checkpoint(
+    hparams_path = tutils.get_data_path(logger, path_dir=tmpdir)
+    hparams_path = os.path.join(hparams_path, 'hparams.yaml')
+    model_2 = EvalModelTemplate.load_from_checkpoint(
         checkpoint_path=new_weights_path,
-        tags_csv=tags_path
+        hparams_file=hparams_path
     )
     model_2.eval()
 
 
 def test_no_val_end_module(tmpdir):
     """Tests use case where trainer saves the model, and user loads it from tags independently."""
-    tutils.reset_seed()
 
-    class CurrentTestModel(LightTrainDataloader, LightValidationStepMixin, TestModelBase):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
+    model = EvalModelTemplate()
 
     # logger file to get meta
-    logger = tutils.get_default_testtube_logger(tmpdir, False)
+    logger = tutils.get_default_logger(tmpdir)
 
-    trainer_options = dict(
+    # fit model
+    trainer = Trainer(
         max_epochs=1,
         logger=logger,
         checkpoint_callback=ModelCheckpoint(tmpdir)
     )
-
-    # fit model
-    trainer = Trainer(**trainer_options)
     result = trainer.fit(model)
 
     # traning complete
@@ -120,11 +79,11 @@ def test_no_val_end_module(tmpdir):
     trainer.save_checkpoint(new_weights_path)
 
     # load new model
-    tags_path = tutils.get_data_path(logger, path_dir=tmpdir)
-    tags_path = os.path.join(tags_path, 'meta_tags.csv')
-    model_2 = LightningTestModel.load_from_checkpoint(
+    hparams_path = tutils.get_data_path(logger, path_dir=tmpdir)
+    hparams_path = os.path.join(hparams_path, 'hparams.yaml')
+    model_2 = EvalModelTemplate.load_from_checkpoint(
         checkpoint_path=new_weights_path,
-        tags_csv=tags_path
+        hparams_file=hparams_path
     )
     model_2.eval()
 
@@ -133,7 +92,6 @@ def test_gradient_accumulation_scheduling(tmpdir):
     """
     Test grad accumulation by the freq of optimizer updates
     """
-    tutils.reset_seed()
 
     # test incorrect configs
     with pytest.raises(IndexError):
@@ -188,8 +146,7 @@ def test_gradient_accumulation_scheduling(tmpdir):
         # clear gradients
         optimizer.zero_grad()
 
-    hparams = tutils.get_default_hparams()
-    model = LightningTestModel(hparams)
+    model = EvalModelTemplate()
     schedule = {1: 2, 3: 4}
 
     trainer = Trainer(accumulate_grad_batches=schedule,
@@ -206,27 +163,52 @@ def test_gradient_accumulation_scheduling(tmpdir):
 
 
 def test_loading_meta_tags(tmpdir):
+    """ test for backward compatibility to meta_tags.csv """
     tutils.reset_seed()
 
-    hparams = tutils.get_default_hparams()
+    hparams = EvalModelTemplate.get_default_hparams()
 
     # save tags
-    logger = tutils.get_default_testtube_logger(tmpdir, False)
+    logger = tutils.get_default_logger(tmpdir)
     logger.log_hyperparams(Namespace(some_str='a_str', an_int=1, a_float=2.0))
     logger.log_hyperparams(hparams)
     logger.save()
 
-    # load tags
+    # load hparams
     path_expt_dir = tutils.get_data_path(logger, path_dir=tmpdir)
+    hparams_path = os.path.join(path_expt_dir, TensorBoardLogger.NAME_HPARAMS_FILE)
+    hparams = load_hparams_from_yaml(hparams_path)
+
+    # save as legacy meta_tags.csv
     tags_path = os.path.join(path_expt_dir, 'meta_tags.csv')
+    save_hparams_to_tags_csv(tags_path, hparams)
+
     tags = load_hparams_from_tags_csv(tags_path)
 
-    assert tags.batch_size == 32 and tags.hidden_dim == 1000
+    assert hparams == tags
+
+
+def test_loading_yaml(tmpdir):
+    tutils.reset_seed()
+
+    hparams = EvalModelTemplate.get_default_hparams()
+
+    # save tags
+    logger = tutils.get_default_logger(tmpdir)
+    logger.log_hyperparams(Namespace(some_str='a_str', an_int=1, a_float=2.0))
+    logger.log_hyperparams(hparams)
+    logger.save()
+
+    # load hparams
+    path_expt_dir = tutils.get_data_path(logger, path_dir=tmpdir)
+    hparams_path = os.path.join(path_expt_dir, 'hparams.yaml')
+    tags = load_hparams_from_yaml(hparams_path)
+
+    assert tags['batch_size'] == 32 and tags['hidden_dim'] == 1000
 
 
 def test_dp_output_reduce():
     mixin = TrainerLoggingMixin()
-    tutils.reset_seed()
 
     # test identity when we have a single gpu
     out = torch.rand(3, 1)
@@ -247,31 +229,31 @@ def test_dp_output_reduce():
     assert reduced['b']['c'] == out['b']['c']
 
 
-@pytest.mark.parametrize(["save_top_k", "file_prefix", "expected_files"], [
-    pytest.param(-1, '', {'epoch=4.ckpt', 'epoch=3.ckpt', 'epoch=2.ckpt', 'epoch=1.ckpt', 'epoch=0.ckpt'},
+@pytest.mark.parametrize(["save_top_k", "save_last", "file_prefix", "expected_files"], [
+    pytest.param(-1, False, '', {'epoch=4.ckpt', 'epoch=3.ckpt', 'epoch=2.ckpt', 'epoch=1.ckpt', 'epoch=0.ckpt'},
                  id="CASE K=-1  (all)"),
-    pytest.param(1, 'test_prefix_', {'test_prefix_epoch=4.ckpt'},
+    pytest.param(1, False, 'test_prefix_', {'test_prefix_epoch=4.ckpt'},
                  id="CASE K=1 (2.5, epoch 4)"),
-    pytest.param(2, '', {'epoch=4.ckpt', 'epoch=2.ckpt'},
+    pytest.param(2, False, '', {'epoch=4.ckpt', 'epoch=2.ckpt'},
                  id="CASE K=2 (2.5 epoch 4, 2.8 epoch 2)"),
-    pytest.param(4, '', {'epoch=1.ckpt', 'epoch=4.ckpt', 'epoch=3.ckpt', 'epoch=2.ckpt'},
+    pytest.param(4, False, '', {'epoch=1.ckpt', 'epoch=4.ckpt', 'epoch=3.ckpt', 'epoch=2.ckpt'},
                  id="CASE K=4 (save all 4 base)"),
-    pytest.param(3, '', {'epoch=2.ckpt', 'epoch=3.ckpt', 'epoch=4.ckpt'},
+    pytest.param(3, False, '', {'epoch=2.ckpt', 'epoch=3.ckpt', 'epoch=4.ckpt'},
                  id="CASE K=3 (save the 2nd, 3rd, 4th model)"),
+    pytest.param(1, True, '', {'epoch=4.ckpt', 'last.ckpt'},
+                 id="CASE K=1 (save the 4th model and the last model)"),
 ])
-def test_model_checkpoint_options(tmpdir, save_top_k, file_prefix, expected_files):
+def test_model_checkpoint_options(tmpdir, save_top_k, save_last, file_prefix, expected_files):
     """Test ModelCheckpoint options."""
 
-    def mock_save_function(filepath):
+    def mock_save_function(filepath, *args):
         open(filepath, 'a').close()
-
-    hparams = tutils.get_default_hparams()
-    _ = LightningTestModel(hparams)
 
     # simulated losses
     losses = [10, 9, 2.8, 5, 2.5]
 
-    checkpoint_callback = ModelCheckpoint(tmpdir, save_top_k=save_top_k, prefix=file_prefix, verbose=1)
+    checkpoint_callback = ModelCheckpoint(tmpdir, save_top_k=save_top_k, save_last=save_last,
+                                          prefix=file_prefix, verbose=1)
     checkpoint_callback.save_function = mock_save_function
     trainer = Trainer()
 
@@ -291,11 +273,47 @@ def test_model_checkpoint_options(tmpdir, save_top_k, file_prefix, expected_file
         assert fname in file_lists
 
 
-def test_model_freeze_unfreeze():
-    tutils.reset_seed()
+def test_model_checkpoint_only_weights(tmpdir):
+    """Tests use case where ModelCheckpoint is configured to save only model weights, and
+     user tries to load checkpoint to resume training.
+     """
+    model = EvalModelTemplate()
 
-    hparams = tutils.get_default_hparams()
-    model = LightningTestModel(hparams)
+    trainer = Trainer(
+        max_epochs=1,
+        checkpoint_callback=ModelCheckpoint(tmpdir, save_weights_only=True)
+    )
+    # fit model
+    result = trainer.fit(model)
+    # training complete
+    assert result == 1, 'training failed to complete'
+
+    checkpoint_path = list(trainer.checkpoint_callback.best_k_models.keys())[0]
+
+    # assert saved checkpoint has no trainer data
+    checkpoint = torch.load(checkpoint_path)
+    assert 'optimizer_states' not in checkpoint, 'checkpoint should contain only model weights'
+    assert 'lr_schedulers' not in checkpoint, 'checkpoint should contain only model weights'
+
+    # assert loading model works when checkpoint has only weights
+    assert EvalModelTemplate.load_from_checkpoint(checkpoint_path=checkpoint_path)
+
+    # directly save model
+    new_weights_path = os.path.join(tmpdir, 'save_test.ckpt')
+    trainer.save_checkpoint(new_weights_path, weights_only=True)
+    # assert saved checkpoint has no trainer data
+    checkpoint = torch.load(new_weights_path)
+    assert 'optimizer_states' not in checkpoint, 'checkpoint should contain only model weights'
+    assert 'lr_schedulers' not in checkpoint, 'checkpoint should contain only model weights'
+
+    # assert restoring train state fails
+    with pytest.raises(KeyError, match='checkpoint contains only the model'):
+        trainer.restore_training_state(checkpoint)
+
+
+def test_model_freeze_unfreeze():
+
+    model = EvalModelTemplate()
 
     model.freeze()
     model.unfreeze()
@@ -303,17 +321,15 @@ def test_model_freeze_unfreeze():
 
 def test_resume_from_checkpoint_epoch_restored(tmpdir):
     """Verify resuming from checkpoint runs the right number of epochs"""
-    import types
 
-    tutils.reset_seed()
-
-    hparams = tutils.get_default_hparams()
+    hparams = EvalModelTemplate.get_default_hparams()
 
     def _new_model():
         # Create a model that tracks epochs and batches seen
-        model = LightningTestModel(hparams)
+        model = EvalModelTemplate(**hparams)
         model.num_epochs_seen = 0
         model.num_batches_seen = 0
+        model.num_on_load_checkpoint_called = 0
 
         def increment_epoch(self):
             self.num_epochs_seen += 1
@@ -321,10 +337,14 @@ def test_resume_from_checkpoint_epoch_restored(tmpdir):
         def increment_batch(self, _):
             self.num_batches_seen += 1
 
-        # Bind the increment_epoch function on_epoch_end so that the
-        # model keeps track of the number of epochs it has seen.
+        def increment_on_load_checkpoint(self, _):
+            self.num_on_load_checkpoint_called += 1
+
+        # Bind methods to keep track of epoch numbers, batch numbers it has seen
+        # as well as number of times it has called on_load_checkpoint()
         model.on_epoch_end = types.MethodType(increment_epoch, model)
         model.on_batch_start = types.MethodType(increment_batch, model)
+        model.on_load_checkpoint = types.MethodType(increment_on_load_checkpoint, model)
         return model
 
     model = _new_model()
@@ -335,20 +355,20 @@ def test_resume_from_checkpoint_epoch_restored(tmpdir):
         train_percent_check=0.65,
         val_percent_check=1,
         checkpoint_callback=ModelCheckpoint(tmpdir, save_top_k=-1),
-        logger=False,
         default_root_dir=tmpdir,
         early_stop_callback=False,
         val_check_interval=1.,
     )
 
-    # fit model
     trainer = Trainer(**trainer_options)
+    # fit model
     trainer.fit(model)
 
     training_batches = trainer.num_training_batches
 
     assert model.num_epochs_seen == 2
     assert model.num_batches_seen == training_batches * 2
+    assert model.num_on_load_checkpoint_called == 0
 
     # Other checkpoints can be uncommented if/when resuming mid-epoch is supported
     checkpoints = sorted(glob.glob(os.path.join(trainer.checkpoint_callback.dirpath, '*.ckpt')))
@@ -362,12 +382,12 @@ def test_resume_from_checkpoint_epoch_restored(tmpdir):
         new_trainer = Trainer(**trainer_options, resume_from_checkpoint=check)
         new_trainer.fit(next_model)
         assert state['global_step'] + next_model.num_batches_seen == training_batches * trainer_options['max_epochs']
+        assert next_model.num_on_load_checkpoint_called == 1
 
 
 def _init_steps_model():
     """private method for initializing a model with 5% train epochs"""
-    tutils.reset_seed()
-    model, _ = tutils.get_default_model()
+    model = EvalModelTemplate()
 
     # define train epoch to 5% of data
     train_percent = 0.5
@@ -385,11 +405,11 @@ def test_trainer_max_steps_and_epochs(tmpdir):
     model, trainer_options, num_train_samples = _init_steps_model()
 
     # define less train steps than epochs
-    trainer_options.update(dict(
+    trainer_options.update(
         default_root_dir=tmpdir,
         max_epochs=3,
         max_steps=num_train_samples + 10
-    ))
+    )
 
     # fit model
     trainer = Trainer(**trainer_options)
@@ -400,10 +420,10 @@ def test_trainer_max_steps_and_epochs(tmpdir):
     assert trainer.global_step == trainer.max_steps, "Model did not stop at max_steps"
 
     # define less train epochs than steps
-    trainer_options.update(dict(
+    trainer_options.update(
         max_epochs=2,
         max_steps=trainer_options['max_epochs'] * 2 * num_train_samples
-    ))
+    )
 
     # fit model
     trainer = Trainer(**trainer_options)
@@ -420,13 +440,13 @@ def test_trainer_min_steps_and_epochs(tmpdir):
     model, trainer_options, num_train_samples = _init_steps_model()
 
     # define callback for stopping the model and default epochs
-    trainer_options.update(dict(
+    trainer_options.update(
         default_root_dir=tmpdir,
         early_stop_callback=EarlyStopping(monitor='val_loss', min_delta=1.0),
         val_check_interval=2,
         min_epochs=1,
         max_epochs=5
-    ))
+    )
 
     # define less min steps than 1 epoch
     trainer_options['min_steps'] = math.floor(num_train_samples / 2)
@@ -455,30 +475,19 @@ def test_trainer_min_steps_and_epochs(tmpdir):
 
 def test_benchmark_option(tmpdir):
     """Verify benchmark option."""
-    tutils.reset_seed()
 
-    class CurrentTestModel(
-        LightValidationMultipleDataloadersMixin,
-        LightTrainDataloader,
-        TestModelBase
-    ):
-        pass
-
-    hparams = tutils.get_default_hparams()
-    model = CurrentTestModel(hparams)
+    model = EvalModelTemplate()
+    model.val_dataloader = model.val_dataloader__multiple
 
     # verify torch.backends.cudnn.benchmark is not turned on
     assert not torch.backends.cudnn.benchmark
 
-    # logger file to get meta
-    trainer_options = dict(
+    # fit model
+    trainer = Trainer(
         default_root_dir=tmpdir,
         max_epochs=1,
         benchmark=True,
     )
-
-    # fit model
-    trainer = Trainer(**trainer_options)
     result = trainer.fit(model)
 
     # verify training completed
@@ -489,41 +498,34 @@ def test_benchmark_option(tmpdir):
 
 
 def test_testpass_overrides(tmpdir):
-    hparams = tutils.get_default_hparams()
-
-    class LocalModel(LightTrainDataloader, TestModelBase):
-        pass
-
-    class LocalModelNoEnd(LightTrainDataloader, LightTestDataloader, LightEmptyTestStep, TestModelBase):
-        pass
-
-    class LocalModelNoStep(LightTrainDataloader, TestModelBase):
-        def test_epoch_end(self, outputs):
-            return {}
+    # todo: check duplicated tests against trainer_checks
+    hparams = EvalModelTemplate.get_default_hparams()
 
     # Misconfig when neither test_step or test_end is implemented
-    with pytest.raises(MisconfigurationException):
-        model = LocalModel(hparams)
+    with pytest.raises(MisconfigurationException, match='.*not implement `test_dataloader`.*'):
+        model = EvalModelTemplate(**hparams)
+        model.test_dataloader = LightningModule.test_dataloader
         Trainer().test(model)
 
     # Misconfig when neither test_step or test_end is implemented
     with pytest.raises(MisconfigurationException):
-        model = LocalModelNoStep(hparams)
+        model = EvalModelTemplate(**hparams)
+        model.test_step = LightningModule.test_step
         Trainer().test(model)
 
     # No exceptions when one or both of test_step or test_end are implemented
-    model = LocalModelNoEnd(hparams)
+    model = EvalModelTemplate(**hparams)
+    model.test_step_end = LightningModule.test_step_end
     Trainer().test(model)
 
-    model = LightningTestModel(hparams)
+    model = EvalModelTemplate(**hparams)
     Trainer().test(model)
 
 
 def test_disabled_validation():
     """Verify that `val_percent_check=0` disables the validation loop unless `fast_dev_run=True`."""
-    tutils.reset_seed()
 
-    class CurrentModel(LightTrainDataloader, LightValidationMixin, TestModelBase):
+    class CurrentModel(EvalModelTemplate):
 
         validation_step_invoked = False
         validation_epoch_end_invoked = False
@@ -536,11 +538,11 @@ def test_disabled_validation():
             self.validation_epoch_end_invoked = True
             return super().validation_epoch_end(*args, **kwargs)
 
-    hparams = tutils.get_default_hparams()
-    model = CurrentModel(hparams)
+    hparams = EvalModelTemplate.get_default_hparams()
+    model = CurrentModel(**hparams)
 
     trainer_options = dict(
-        show_progress_bar=False,
+        progress_bar_refresh_rate=0,
         max_epochs=2,
         train_percent_check=0.4,
         val_percent_check=0.0,
@@ -559,7 +561,7 @@ def test_disabled_validation():
         '`validation_epoch_end` should not run when `val_percent_check=0`'
 
     # check that val_percent_check has no influence when fast_dev_run is turned on
-    model = CurrentModel(hparams)
+    model = CurrentModel(**hparams)
     trainer_options.update(fast_dev_run=True)
     trainer = Trainer(**trainer_options)
     result = trainer.fit(model)
@@ -573,59 +575,56 @@ def test_disabled_validation():
 
 
 def test_nan_loss_detection(tmpdir):
-    test_step = 8
 
-    class InfLossModel(LightTrainDataloader, TestModelBase):
+    class CurrentModel(EvalModelTemplate):
+        test_batch_inf_loss = 8
 
-        def training_step(self, batch, batch_idx):
-            output = super().training_step(batch, batch_idx)
-            if batch_idx == test_step:
+        def training_step(self, batch, batch_idx, optimizer_idx=None):
+            output = super().training_step(batch, batch_idx, optimizer_idx)
+            if batch_idx == self.test_batch_inf_loss:
                 if isinstance(output, dict):
                     output['loss'] *= torch.tensor(math.inf)  # make loss infinite
                 else:
                     output /= 0
             return output
 
-    hparams = tutils.get_default_hparams()
-    model = InfLossModel(hparams)
+    model = CurrentModel()
 
     # fit model
     trainer = Trainer(
         default_root_dir=tmpdir,
-        max_steps=(test_step + 1),
+        max_steps=(model.test_batch_inf_loss + 1),
         terminate_on_nan=True
     )
 
     with pytest.raises(ValueError, match=r'.*The loss returned in `training_step` is nan or inf.*'):
         trainer.fit(model)
-        assert trainer.global_step == test_step
+        assert trainer.global_step == model.test_step_inf_loss
 
     for param in model.parameters():
         assert torch.isfinite(param).all()
 
 
 def test_nan_params_detection(tmpdir):
-    test_step = 8
 
-    class NanParamModel(LightTrainDataloader, TestModelBase):
+    class CurrentModel(EvalModelTemplate):
+        test_batch_nan = 8
 
         def on_after_backward(self):
-            if self.global_step == test_step:
+            if self.global_step == self.test_batch_nan:
                 # simulate parameter that became nan
                 torch.nn.init.constant_(self.c_d1.bias, math.nan)
 
-    hparams = tutils.get_default_hparams()
-
-    model = NanParamModel(hparams)
+    model = CurrentModel()
     trainer = Trainer(
         default_root_dir=tmpdir,
-        max_steps=(test_step + 1),
+        max_steps=(model.test_batch_nan + 1),
         terminate_on_nan=True
     )
 
     with pytest.raises(ValueError, match=r'.*Detected nan and/or inf values in `c_d1.bias`.*'):
         trainer.fit(model)
-        assert trainer.global_step == test_step
+        assert trainer.global_step == model.test_batch_nan
 
     # after aborting the training loop, model still has nan-valued params
     params = torch.cat([param.view(-1) for param in model.parameters()])
@@ -635,7 +634,7 @@ def test_nan_params_detection(tmpdir):
 def test_trainer_interrupted_flag(tmpdir):
     """Test the flag denoting that a user interrupted training."""
 
-    model = DictHparamsModel({'in_features': 28 * 28, 'out_features': 10})
+    model = EvalModelTemplate()
 
     class InterruptCallback(Callback):
         def __init__(self):
@@ -646,17 +645,15 @@ def test_trainer_interrupted_flag(tmpdir):
 
     interrupt_callback = InterruptCallback()
 
-    trainer_options = {
-        'callbacks': [interrupt_callback],
-        'max_epochs': 1,
-        'val_percent_check': 0.1,
-        'train_percent_check': 0.2,
-        'progress_bar_refresh_rate': 0,
-        'logger': False,
-        'default_root_dir': tmpdir,
-    }
-
-    trainer = Trainer(**trainer_options)
+    trainer = Trainer(
+        callbacks=[interrupt_callback],
+        max_epochs=1,
+        val_percent_check=0.1,
+        train_percent_check=0.2,
+        progress_bar_refresh_rate=0,
+        logger=False,
+        default_root_dir=tmpdir,
+    )
     assert not trainer.interrupted
     trainer.fit(model)
     assert trainer.interrupted
@@ -666,10 +663,8 @@ def test_gradient_clipping(tmpdir):
     """
     Test gradient clipping
     """
-    tutils.reset_seed()
 
-    hparams = tutils.get_default_hparams()
-    model = LightningTestModel(hparams)
+    model = EvalModelTemplate()
 
     # test that gradient is clipped correctly
     def _optimizer_step(*args, **kwargs):
@@ -764,7 +759,7 @@ def test_gpu_choice(tmpdir):
     ),
     pytest.param(
         dict(distributed_backend=None, gpus=2),
-        dict(use_dp=True, use_ddp=False, use_ddp2=False, num_gpus=2, on_gpu=True, single_gpu=False, num_processes=1),
+        dict(use_dp=False, use_ddp=True, use_ddp2=False, num_gpus=2, on_gpu=True, single_gpu=False, num_processes=2),
         marks=[pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Multiple GPUs needed")]
     ),
     pytest.param(
@@ -792,3 +787,41 @@ def test_trainer_config(trainer_kwargs, expected):
     assert trainer.on_gpu is expected["on_gpu"]
     assert trainer.single_gpu is expected["single_gpu"]
     assert trainer.num_processes == expected["num_processes"]
+
+
+def test_trainer_subclassing():
+    model = EvalModelTemplate()
+
+    # First way of pulling out args from signature is to list them
+    class TrainerSubclass(Trainer):
+
+        def __init__(self, custom_arg, *args, custom_kwarg='test', **kwargs):
+            super().__init__(*args, **kwargs)
+            self.custom_arg = custom_arg
+            self.custom_kwarg = custom_kwarg
+
+    trainer = TrainerSubclass(123, custom_kwarg='custom', fast_dev_run=True)
+    result = trainer.fit(model)
+    assert result == 1
+    assert trainer.custom_arg == 123
+    assert trainer.custom_kwarg == 'custom'
+    assert trainer.fast_dev_run
+
+    # Second way is to pop from the dict
+    # It's a special case because Trainer does not have any positional args
+    class TrainerSubclass(Trainer):
+
+        def __init__(self, **kwargs):
+            self.custom_arg = kwargs.pop('custom_arg', 0)
+            self.custom_kwarg = kwargs.pop('custom_kwarg', 'test')
+            super().__init__(**kwargs)
+
+    trainer = TrainerSubclass(custom_kwarg='custom', fast_dev_run=True)
+    result = trainer.fit(model)
+    assert result == 1
+    assert trainer.custom_kwarg == 'custom'
+    assert trainer.fast_dev_run
+
+    # when we pass in an unknown arg, the base class should complain
+    with pytest.raises(TypeError, match=r"__init__\(\) got an unexpected keyword argument 'abcdefg'") as e:
+        TrainerSubclass(abcdefg='unknown_arg')

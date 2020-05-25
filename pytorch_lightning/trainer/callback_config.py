@@ -1,15 +1,18 @@
 import os
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, List
 
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint, EarlyStopping, ProgressBarBase, ProgressBar
 from pytorch_lightning.loggers import LightningLoggerBase
+from pytorch_lightning.utilities.exceptions import MisconfigurationException
 
 
 class TrainerCallbackConfigMixin(ABC):
 
     # this is just a summary on variables used in this abstract class,
     #  the proper values/initialisation should be done in child class
+    callbacks: List[Callback]
     default_root_dir: str
     logger: Union[LightningLoggerBase, bool]
     weights_save_path: str
@@ -33,7 +36,7 @@ class TrainerCallbackConfigMixin(ABC):
         Otherwise use os.getcwd()
         """
         ckpt_path = self.default_root_dir
-        if self.checkpoint_callback is True:
+        if self.checkpoint_callback:
             # init a default one
             if self.logger is not None:
                 save_dir = (getattr(self.logger, 'save_dir', None) or
@@ -44,25 +47,33 @@ class TrainerCallbackConfigMixin(ABC):
                 if self.weights_save_path is not None:
                     save_dir = self.weights_save_path
 
+                version = self.logger.version if isinstance(
+                    self.logger.version, str) else f'version_{self.logger.version}'
                 ckpt_path = os.path.join(
                     save_dir,
                     self.logger.name,
-                    f'version_{self.logger.version}',
+                    version,
                     "checkpoints"
                 )
             else:
                 ckpt_path = os.path.join(self.default_root_dir, "checkpoints")
 
             # when no val step is defined, use 'loss' otherwise 'val_loss'
-            train_step_only = not self.is_overriden('validation_step')
+            train_step_only = not self.is_overridden('validation_step')
             monitor_key = 'loss' if train_step_only else 'val_loss'
 
-            self.ckpt_path = ckpt_path
-            os.makedirs(ckpt_path, exist_ok=True)
-            self.checkpoint_callback = ModelCheckpoint(
-                filepath=ckpt_path,
-                monitor=monitor_key
-            )
+            if self.checkpoint_callback is True:
+                os.makedirs(ckpt_path, exist_ok=True)
+                self.checkpoint_callback = ModelCheckpoint(
+                    filepath=ckpt_path,
+                    monitor=monitor_key
+                )
+            # If user specified None in filepath, override with runtime default
+            elif isinstance(self.checkpoint_callback, ModelCheckpoint) \
+                    and self.checkpoint_callback.dirpath is None:
+                self.checkpoint_callback.dirpath = ckpt_path
+                self.checkpoint_callback.filename = '{epoch}'
+                os.makedirs(self.checkpoint_callback.dirpath, exist_ok=True)
         elif self.checkpoint_callback is False:
             self.checkpoint_callback = None
 
@@ -95,3 +106,23 @@ class TrainerCallbackConfigMixin(ABC):
         else:
             self.early_stop_callback = early_stop_callback
             self.enable_early_stop = True
+
+    def configure_progress_bar(self, refresh_rate=1, process_position=0):
+        progress_bars = [c for c in self.callbacks if isinstance(c, ProgressBarBase)]
+        if len(progress_bars) > 1:
+            raise MisconfigurationException(
+                'You added multiple progress bar callbacks to the Trainer, but currently only one'
+                ' progress bar is supported.'
+            )
+        elif len(progress_bars) == 1:
+            progress_bar_callback = progress_bars[0]
+        elif refresh_rate > 0:
+            progress_bar_callback = ProgressBar(
+                refresh_rate=refresh_rate,
+                process_position=process_position,
+            )
+            self.callbacks.append(progress_bar_callback)
+        else:
+            progress_bar_callback = None
+
+        return progress_bar_callback

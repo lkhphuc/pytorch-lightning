@@ -1,5 +1,6 @@
 from abc import ABC
 from collections import OrderedDict
+
 import torch
 
 
@@ -50,7 +51,7 @@ class ValidationStepVariations(ABC):
             })
             return output
 
-    def validation_step_multiple_dataloaders(self, batch, batch_idx, dataloader_idx, **kwargs):
+    def validation_step__multiple_dataloaders(self, batch, batch_idx, dataloader_idx, **kwargs):
         """
         Lightning calls this inside the validation loop
         :param batch:

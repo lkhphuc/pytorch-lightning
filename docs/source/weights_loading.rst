@@ -1,3 +1,10 @@
+.. testsetup:: *
+
+    import os
+    from pytorch_lightning.trainer.trainer import Trainer
+    from pytorch_lightning.core.lightning import LightningModule
+
+
 Saving and loading weights
 ==========================
 
@@ -22,13 +29,13 @@ Automatic saving
 Checkpointing is enabled by default to the current working directory.
 To change the checkpoint path pass in:
 
-.. code-block:: python
+.. testcode::
 
-    Trainer(default_save_path='/your/path/to/save/checkpoints')
+    trainer = Trainer(default_save_path='/your/path/to/save/checkpoints')
 
 To modify the behavior of checkpointing pass in your own callback.
 
-.. code-block:: python
+.. testcode::
 
     from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -47,30 +54,25 @@ To modify the behavior of checkpointing pass in your own callback.
 
 Or disable it by passing
 
+.. testcode::
+
+   trainer = Trainer(checkpoint_callback=False)
+
+
+The Lightning checkpoint also saves the arguments passed into the LightningModule init
+under the `module_arguments` key in the checkpoint.
+
 .. code-block:: python
 
-        trainer = Trainer(checkpoint_callback=False)
+    class MyLightningModule(LightningModule):
 
+       def __init__(self, learning_rate, *args, **kwargs):
+            super().__init__()
 
-The Lightning checkpoint also saves the hparams (hyperparams) passed into the LightningModule init.
-
-.. note:: hparams is a `Namespace <https://docs.python.org/2/library/argparse.html#argparse.Namespace>`_.
-
-.. code-block:: python
-   :emphasize-lines: 8
-
-   from argparse import Namespace
-
-   # usually these come from command line args
-   args = Namespace(learning_rate=0.001)
-
-   # define you module to have hparams as the first arg
-   # this means your checkpoint will have everything that went into making
-   # this model (in this case, learning rate)
-   class MyLightningModule(pl.LightningModule):
-
-       def __init__(self, hparams, ...):
-           self.hparams = hparams
+    # all init args were saved to the checkpoint
+    checkpoint = torch.load(CKPT_PATH)
+    print(checkpoint['module_arguments'])
+    # {'learning_rate': the_value}
 
 Manual saving
 ^^^^^^^^^^^^^
@@ -78,7 +80,7 @@ You can manually save checkpoints and restore your model from the checkpointed s
 
 .. code-block:: python
 
-    model = MyModel(hparams)
+    model = MyLightningModule(hparams)
     trainer.fit(model)
     trainer.save_checkpoint("example.ckpt")
     new_model = MyModel.load_from_checkpoint(checkpoint_path="example.ckpt")
@@ -86,38 +88,43 @@ You can manually save checkpoints and restore your model from the checkpointed s
 Checkpoint Loading
 ------------------
 
-To load a model along with its weights, biases and hyperparameters use following method.
+To load a model along with its weights, biases and `module_arguments` use following method.
 
 .. code-block:: python
 
     model = MyLightingModule.load_from_checkpoint(PATH)
+
+    print(model.learning_rate)
+    # prints the learning_rate you used in this checkpoint
+
     model.eval()
     y_hat = model(x)
 
-The above only works if you used `hparams` in your model definition
+But if you don't want to use the values saved in the checkpoint, pass in your own here
 
-.. code-block:: python
+.. testcode::
 
-    class MyModel(pl.LightningModule):
-
-        def __init__(self, hparams):
-            self.hparams = hparams
-            self.l1 = nn.Linear(hparams.in_dim, hparams.out_dim)
-
-But if you don't and instead pass individual parameters
-
-.. code-block:: python
-
-    class MyModel(pl.LightningModule):
+    class LitModel(LightningModule):
 
         def __init__(self, in_dim, out_dim):
-            self.l1 = nn.Linear(in_dim, out_dim)
+            super().__init__()
+            self.in_dim = in_dim
+            self.out_dim = out_dim
+            self.l1 = nn.Linear(self.in_dim, self.out_dim)
 
 you can restore the model like this
 
 .. code-block:: python
 
-    model = MyModel.load_from_checkpoint(PATH, in_dim=128, out_dim=10)
+    # if you train and save the model like this it will use these values when loading
+    # the weights. But you can overwrite this
+    LitModel(in_dim=32, out_dim=10)
+
+    # uses in_dim=32, out_dim=10
+    model = LitModel.load_from_checkpoint(PATH)
+
+    # uses in_dim=128, out_dim=10
+    model = LitModel.load_from_checkpoint(PATH, in_dim=128, out_dim=10)
 
 
 Restoring Training State
